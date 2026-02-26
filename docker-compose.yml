@@ -22,6 +22,12 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/entrypoint.sh", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     environment:
       DB_TYPE: mysql
       DB_HOST: mysql
@@ -44,6 +50,7 @@ services:
       TRIGGER_ERROR_FILE: ${TRIGGER_ERROR_FILE:-.backup_error}
       TRIGGER_LOCK_FILE: ${TRIGGER_LOCK_FILE:-.backup_lock}
       TRIGGER_LOCK_TIMEOUT_SEC: ${TRIGGER_LOCK_TIMEOUT_SEC:-300}
+      HEALTHCHECK_REQUIRE_DB: ${HEALTHCHECK_REQUIRE_DB:-1}
     volumes:
       # Create .db-saver in this host directory to enable trigger-by-file backups.
       - ${DB_BACKUP_PATH}:/backups

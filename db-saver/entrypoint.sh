@@ -43,6 +43,9 @@ TRIGGER_DONE_FILE="${TRIGGER_DONE_FILE:-.backup_done}"
 TRIGGER_ERROR_FILE="${TRIGGER_ERROR_FILE:-.backup_error}"
 TRIGGER_LOCK_FILE="${TRIGGER_LOCK_FILE:-.backup_lock}"
 TRIGGER_LOCK_TIMEOUT_SEC="${TRIGGER_LOCK_TIMEOUT_SEC:-300}"
+HEALTH_STATE_DIR="${HEALTH_STATE_DIR:-/tmp/db-saver-state}"
+HEALTH_READY_FILE="${HEALTH_READY_FILE:-${HEALTH_STATE_DIR}/startup-ready}"
+HEALTHCHECK_REQUIRE_DB="${HEALTHCHECK_REQUIRE_DB:-1}"
 
 case "$DB_TYPE" in
   mysql | mariadb)
@@ -87,6 +90,9 @@ fi
 if ! [[ "$TRIGGER_LOCK_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || [[ "$TRIGGER_LOCK_TIMEOUT_SEC" == "0" ]]; then
   die "TRIGGER_LOCK_TIMEOUT_SEC must be a positive integer number of seconds."
 fi
+if [[ "$HEALTHCHECK_REQUIRE_DB" != "0" && "$HEALTHCHECK_REQUIRE_DB" != "1" ]]; then
+  die "HEALTHCHECK_REQUIRE_DB must be 0 or 1."
+fi
 
 BACKUP_SQL_PATH="${BACKUP_DIR}/${BACKUP_BASENAME}.sql"
 BACKUP_DUMP_PATH="${BACKUP_DIR}/${BACKUP_BASENAME}.dump"
@@ -97,6 +103,7 @@ TRIGGER_REQUEST_PATH="${BACKUP_DIR}/${TRIGGER_REQUEST_FILE}"
 TRIGGER_DONE_PATH="${BACKUP_DIR}/${TRIGGER_DONE_FILE}"
 TRIGGER_ERROR_PATH="${BACKUP_DIR}/${TRIGGER_ERROR_FILE}"
 TRIGGER_LOCK_PATH="${BACKUP_DIR}/${TRIGGER_LOCK_FILE}"
+STARTUP_RESTORE_STATUS="not_run"
 
 MYSQL_BIN=""
 MYSQL_DUMP_BIN=""
@@ -118,6 +125,24 @@ fi
 
 ensure_backup_dir() {
   mkdir -p "$BACKUP_DIR"
+}
+
+ensure_health_state_dir() {
+  mkdir -p "$HEALTH_STATE_DIR"
+}
+
+clear_startup_ready_state() {
+  rm -f "$HEALTH_READY_FILE"
+}
+
+write_startup_ready_state() {
+  local restore_status="$1"
+  ensure_health_state_dir
+  atomic_write_content "$HEALTH_READY_FILE" "$(printf 'ready=1\nrestore_status=%s\nupdated_at=%s\n' "$restore_status" "$(date -Iseconds)")"
+}
+
+is_startup_ready() {
+  [[ -s "$HEALTH_READY_FILE" ]]
 }
 
 atomic_write_content() {
@@ -406,11 +431,13 @@ restore_if_empty_logic() {
 
   if [[ -f "$RESTORE_MARKER_PATH" ]]; then
     log "INFO" "Restore marker ${RESTORE_MARKER_PATH} found, skipping auto-restore."
+    STARTUP_RESTORE_STATUS="marker_present"
     return 0
   fi
 
   if ! latest_backup_exists; then
     log "INFO" "No latest backup file found, skipping auto-restore."
+    STARTUP_RESTORE_STATUS="no_backup_found"
     return 0
   fi
 
@@ -419,8 +446,10 @@ restore_if_empty_logic() {
     perform_restore
     touch "$RESTORE_MARKER_PATH"
     log "INFO" "Restore completed; marker written to ${RESTORE_MARKER_PATH}."
+    STARTUP_RESTORE_STATUS="restored"
   else
     log "INFO" "Database is not empty, skipping auto-restore."
+    STARTUP_RESTORE_STATUS="db_not_empty"
   fi
 }
 
@@ -502,6 +531,7 @@ on_term() {
   fi
   shutdown_in_progress=1
 
+  clear_startup_ready_state
   log "INFO" "Signal received, attempting backup before exit."
   set +e
   if wait_for_db 10; then
@@ -524,6 +554,7 @@ mode="${1:-run}"
 
 case "$mode" in
   run)
+    clear_startup_ready_state
     log "INFO" "Mode=run, waiting for database at ${DB_HOST}:${DB_PORT}."
     if ! wait_for_db "$WAIT_TIMEOUT_SEC"; then
       die "Database did not become ready within ${WAIT_TIMEOUT_SEC}s."
@@ -534,7 +565,11 @@ case "$mode" in
       restore_if_empty_logic
     else
       log "INFO" "RESTORE_IF_EMPTY=0, skipping auto-restore."
+      STARTUP_RESTORE_STATUS="restore_disabled"
     fi
+
+    write_startup_ready_state "$STARTUP_RESTORE_STATUS"
+    log "INFO" "Startup checks completed (restore_status=${STARTUP_RESTORE_STATUS}); db_backup is ready."
 
     if [[ "$TRIGGER_MODE" == "1" ]]; then
       log "INFO" "TRIGGER_MODE=1, starting trigger watcher loop."
@@ -567,10 +602,20 @@ case "$mode" in
     if ! wait_for_db "$WAIT_TIMEOUT_SEC"; then
       die "Database did not become ready within ${WAIT_TIMEOUT_SEC}s."
     fi
+    write_startup_ready_state "watch_mode"
     log "INFO" "Starting trigger watcher loop."
     watch_trigger_loop
     ;;
+  healthcheck)
+    if ! is_startup_ready; then
+      exit 1
+    fi
+    if [[ "$HEALTHCHECK_REQUIRE_DB" == "1" ]] && ! db_ready; then
+      exit 1
+    fi
+    exit 0
+    ;;
   *)
-    die "Unsupported mode: ${mode}. Use run|backup|restore-if-empty|watch."
+    die "Unsupported mode: ${mode}. Use run|backup|restore-if-empty|watch|healthcheck."
     ;;
 esac

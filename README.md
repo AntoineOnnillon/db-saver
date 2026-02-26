@@ -4,7 +4,8 @@ Le service `db_backup` (build `./db-saver`) gère :
 - backup logique dans `latest.*` (pas de rotation) ;
 - restore auto au démarrage si DB vide ;
 - backup à l'arrêt (`trap SIGTERM`) ;
-- trigger backup par fichiers dans `/backups` (compatible Backrest sans accès Docker).
+- trigger backup par fichiers dans `/backups` (compatible Backrest sans accès Docker) ;
+- healthcheck Docker "ready" après séquence startup (wait DB + restore-if-empty).
 
 ## Fichiers de dump
 
@@ -32,6 +33,25 @@ Comportement :
 
 ```bash
 docker compose exec -T db_backup /entrypoint.sh backup
+```
+
+## Healthcheck `db_backup` (gating de démarrage)
+
+`db_backup` expose `/entrypoint.sh healthcheck` :
+- `healthy` uniquement quand le startup est terminé ;
+- startup terminé = DB joignable + restore-if-empty exécuté (ou skip explicite) ;
+- option `HEALTHCHECK_REQUIRE_DB=1` (défaut) vérifie aussi la connectivité DB à chaque probe.
+
+Pour démarrer un service applicatif uniquement quand `db_backup` est prêt :
+
+```yaml
+services:
+  app:
+    depends_on:
+      db_backup:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
 ```
 
 ## Exemple script Backrest (sans Docker)
@@ -123,6 +143,9 @@ touch /db_dump/mysql-test/.db-saver
 - `TRIGGER_ERROR_FILE` (défaut `.backup_error`)
 - `TRIGGER_LOCK_FILE` (défaut `.backup_lock`)
 - `TRIGGER_LOCK_TIMEOUT_SEC` (défaut `300`)
+- `HEALTH_STATE_DIR` (défaut `/tmp/db-saver-state`)
+- `HEALTH_READY_FILE` (défaut `/tmp/db-saver-state/startup-ready`)
+- `HEALTHCHECK_REQUIRE_DB=1|0` (défaut `1`)
 
 ## Test restore (manuel)
 
