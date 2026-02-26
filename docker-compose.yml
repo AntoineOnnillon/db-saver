@@ -1,0 +1,53 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ${MYSQL_DATA_PATH:-mysql_data}:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 20s
+      timeout: 20s
+      retries: 20
+
+  db_backup:
+    build:
+      context: ./db-saver
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_TYPE: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${MYSQL_DATABASE}
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      BACKUP_DIR: /backups
+      STACK_NAME: ${STACK_NAME:-mysql-test}
+      BACKUP_BASENAME: latest
+      WAIT_TIMEOUT_SEC: ${WAIT_TIMEOUT_SEC:-120}
+      RESTORE_IF_EMPTY: ${RESTORE_IF_EMPTY:-1}
+      EMPTY_CHECK_MODE: ${EMPTY_CHECK_MODE:-tables_count}
+      SENTINEL_TABLE: ${SENTINEL_TABLE:-}
+      TRIGGER_MODE: ${TRIGGER_MODE:-1}
+      TRIGGER_POLL_SEC: ${TRIGGER_POLL_SEC:-2}
+      TRIGGER_MARKER_FILE: ${TRIGGER_MARKER_FILE:-.db-saver}
+      TRIGGER_REQUEST_FILE: ${TRIGGER_REQUEST_FILE:-.backup_request}
+      TRIGGER_DONE_FILE: ${TRIGGER_DONE_FILE:-.backup_done}
+      TRIGGER_ERROR_FILE: ${TRIGGER_ERROR_FILE:-.backup_error}
+      TRIGGER_LOCK_FILE: ${TRIGGER_LOCK_FILE:-.backup_lock}
+      TRIGGER_LOCK_TIMEOUT_SEC: ${TRIGGER_LOCK_TIMEOUT_SEC:-300}
+    volumes:
+      # Create .db-saver in this host directory to enable trigger-by-file backups.
+      - ${DB_BACKUP_PATH}:/backups
+    stop_grace_period: 3m
+
+volumes:
+  mysql_data:
