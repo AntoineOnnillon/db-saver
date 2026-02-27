@@ -38,6 +38,8 @@ services:
       BACKUP_DIR: /backups
       STACK_NAME: ${STACK_NAME:-mysql-test}
       BACKUP_BASENAME: latest
+      BACKUP_MODE: ${BACKUP_MODE:-logical}
+      INCREMENTAL_REBASE_CRON: "${INCREMENTAL_REBASE_CRON:-0 3 * * *}"
       WAIT_TIMEOUT_SEC: ${WAIT_TIMEOUT_SEC:-120}
       RESTORE_IF_EMPTY: ${RESTORE_IF_EMPTY:-1}
       EMPTY_CHECK_MODE: ${EMPTY_CHECK_MODE:-tables_count}

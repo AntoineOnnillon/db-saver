@@ -24,6 +24,171 @@ pg_escape_identifier() {
   printf '%s' "$1" | sed 's/"/""/g'
 }
 
+is_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+validate_cron_field() {
+  local field="$1"
+  local min="$2"
+  local max="$3"
+  local token
+  local base
+  local step
+  local start
+  local end
+  local value
+
+  [[ -n "$field" ]] || return 1
+  IFS=',' read -r -a __cron_tokens <<<"$field"
+  for token in "${__cron_tokens[@]}"; do
+    [[ -n "$token" ]] || return 1
+
+    base="$token"
+    step=1
+    if [[ "$token" == */* ]]; then
+      base="${token%%/*}"
+      step="${token#*/}"
+      is_uint "$step" || return 1
+      (( step > 0 )) || return 1
+    fi
+
+    if [[ "$base" == "*" ]]; then
+      continue
+    fi
+
+    if [[ "$base" == *-* ]]; then
+      start="${base%-*}"
+      end="${base#*-}"
+      is_uint "$start" || return 1
+      is_uint "$end" || return 1
+      (( start >= min && start <= max )) || return 1
+      (( end >= min && end <= max )) || return 1
+      (( start <= end )) || return 1
+      continue
+    fi
+
+    value="$base"
+    is_uint "$value" || return 1
+    (( value >= min && value <= max )) || return 1
+  done
+
+  return 0
+}
+
+validate_cron_expression() {
+  local expr="$1"
+  local minute hour dom month dow extra
+  read -r minute hour dom month dow extra <<<"$expr"
+  [[ -n "${minute:-}" && -n "${hour:-}" && -n "${dom:-}" && -n "${month:-}" && -n "${dow:-}" ]] || return 1
+  [[ -z "${extra:-}" ]] || return 1
+
+  validate_cron_field "$minute" 0 59 || return 1
+  validate_cron_field "$hour" 0 23 || return 1
+  validate_cron_field "$dom" 1 31 || return 1
+  validate_cron_field "$month" 1 12 || return 1
+  validate_cron_field "$dow" 0 7 || return 1
+}
+
+cron_token_matches_numeric() {
+  local token="$1"
+  local value="$2"
+  local min="$3"
+  local max="$4"
+  local base="$token"
+  local step=1
+  local start
+  local end
+
+  if [[ "$token" == */* ]]; then
+    base="${token%%/*}"
+    step="${token#*/}"
+  fi
+
+  if [[ "$base" == "*" ]]; then
+    (( (value - min) % step == 0 ))
+    return
+  fi
+
+  if [[ "$base" == *-* ]]; then
+    start="${base%-*}"
+    end="${base#*-}"
+    (( value >= start && value <= end )) || return 1
+    (( (value - start) % step == 0 ))
+    return
+  fi
+
+  start="$base"
+  if (( step == 1 )); then
+    (( value == start ))
+    return
+  fi
+
+  (( value >= start && value <= max )) || return 1
+  (( (value - start) % step == 0 ))
+}
+
+cron_field_matches() {
+  local field="$1"
+  local value="$2"
+  local min="$3"
+  local max="$4"
+  local is_dow="${5:-0}"
+  local token
+
+  IFS=',' read -r -a __cron_tokens <<<"$field"
+  for token in "${__cron_tokens[@]}"; do
+    if cron_token_matches_numeric "$token" "$value" "$min" "$max"; then
+      return 0
+    fi
+    if [[ "$is_dow" == "1" && "$value" == "0" ]] && cron_token_matches_numeric "$token" 7 "$min" "$max"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cron_expression_matches_now() {
+  local expr="$1"
+  local minute_expr hour_expr dom_expr month_expr dow_expr
+  local now_minute now_hour now_dom now_month now_dow
+  local minute_ok hour_ok dom_ok month_ok dow_ok day_ok
+  local dom_star=0
+  local dow_star=0
+
+  read -r minute_expr hour_expr dom_expr month_expr dow_expr <<<"$expr"
+  read -r now_minute now_hour now_dom now_month now_dow <<<"$(date '+%M %H %d %m %w')"
+  now_minute=$((10#$now_minute))
+  now_hour=$((10#$now_hour))
+  now_dom=$((10#$now_dom))
+  now_month=$((10#$now_month))
+  now_dow=$((10#$now_dow))
+
+  cron_field_matches "$minute_expr" "$now_minute" 0 59 || return 1
+  cron_field_matches "$hour_expr" "$now_hour" 0 23 || return 1
+  cron_field_matches "$month_expr" "$now_month" 1 12 || return 1
+
+  cron_field_matches "$dom_expr" "$now_dom" 1 31 && dom_ok=1 || dom_ok=0
+  cron_field_matches "$dow_expr" "$now_dow" 0 7 1 && dow_ok=1 || dow_ok=0
+
+  [[ "$dom_expr" == "*" ]] && dom_star=1
+  [[ "$dow_expr" == "*" ]] && dow_star=1
+
+  if (( dom_star == 1 && dow_star == 1 )); then
+    day_ok=1
+  elif (( dom_star == 1 )); then
+    day_ok=$dow_ok
+  elif (( dow_star == 1 )); then
+    day_ok=$dom_ok
+  elif (( dom_ok == 1 || dow_ok == 1 )); then
+    day_ok=1
+  else
+    day_ok=0
+  fi
+
+  (( day_ok == 1 ))
+}
+
 DB_TYPE="${DB_TYPE:-}"
 DB_NAME="${DB_NAME:-}"
 DB_USER="${DB_USER:-}"
@@ -31,6 +196,7 @@ DB_PASSWORD="${DB_PASSWORD:-}"
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 STACK_NAME="${STACK_NAME:-}"
 BACKUP_BASENAME="${BACKUP_BASENAME:-latest}"
+BACKUP_MODE="${BACKUP_MODE:-logical}"
 WAIT_TIMEOUT_SEC="${WAIT_TIMEOUT_SEC:-120}"
 RESTORE_IF_EMPTY="${RESTORE_IF_EMPTY:-1}"
 EMPTY_CHECK_MODE="${EMPTY_CHECK_MODE:-tables_count}"
@@ -46,6 +212,8 @@ TRIGGER_LOCK_TIMEOUT_SEC="${TRIGGER_LOCK_TIMEOUT_SEC:-300}"
 HEALTH_STATE_DIR="${HEALTH_STATE_DIR:-/tmp/db-saver-state}"
 HEALTH_READY_FILE="${HEALTH_READY_FILE:-${HEALTH_STATE_DIR}/startup-ready}"
 HEALTHCHECK_REQUIRE_DB="${HEALTHCHECK_REQUIRE_DB:-1}"
+INCREMENTAL_STATE_FILE="${INCREMENTAL_STATE_FILE:-.incremental_state}"
+INCREMENTAL_REBASE_CRON="${INCREMENTAL_REBASE_CRON:-0 3 * * *}"
 
 case "$DB_TYPE" in
   mysql | mariadb)
@@ -93,28 +261,44 @@ fi
 if [[ "$HEALTHCHECK_REQUIRE_DB" != "0" && "$HEALTHCHECK_REQUIRE_DB" != "1" ]]; then
   die "HEALTHCHECK_REQUIRE_DB must be 0 or 1."
 fi
+if [[ "$BACKUP_MODE" != "logical" && "$BACKUP_MODE" != "incremental" ]]; then
+  die "BACKUP_MODE must be logical or incremental."
+fi
+if ! validate_cron_expression "$INCREMENTAL_REBASE_CRON"; then
+  die "INCREMENTAL_REBASE_CRON is invalid. Expected a 5-field cron expression (minute hour day month weekday)."
+fi
 
 BACKUP_SQL_PATH="${BACKUP_DIR}/${BACKUP_BASENAME}.sql"
 BACKUP_DUMP_PATH="${BACKUP_DIR}/${BACKUP_BASENAME}.dump"
 BACKUP_GLOBALS_PATH="${BACKUP_DIR}/globals.sql"
+BACKUP_INCREMENTAL_SQL_PATH="${BACKUP_DIR}/${BACKUP_BASENAME}.incremental.sql"
 RESTORE_MARKER_PATH="${BACKUP_DIR}/.restored"
 TRIGGER_MARKER_PATH="${BACKUP_DIR}/${TRIGGER_MARKER_FILE}"
 TRIGGER_REQUEST_PATH="${BACKUP_DIR}/${TRIGGER_REQUEST_FILE}"
 TRIGGER_DONE_PATH="${BACKUP_DIR}/${TRIGGER_DONE_FILE}"
 TRIGGER_ERROR_PATH="${BACKUP_DIR}/${TRIGGER_ERROR_FILE}"
 TRIGGER_LOCK_PATH="${BACKUP_DIR}/${TRIGGER_LOCK_FILE}"
+INCREMENTAL_STATE_PATH="${BACKUP_DIR}/${INCREMENTAL_STATE_FILE}"
 STARTUP_RESTORE_STATUS="not_run"
 
 MYSQL_BIN=""
 MYSQL_DUMP_BIN=""
+MYSQL_BINLOG_BIN=""
 if [[ "$DB_TYPE" == "mysql" || "$DB_TYPE" == "mariadb" ]]; then
   MYSQL_BIN="$(command -v mysql || true)"
   MYSQL_DUMP_BIN="$(command -v mysqldump || true)"
   if [[ -z "$MYSQL_DUMP_BIN" ]]; then
     MYSQL_DUMP_BIN="$(command -v mariadb-dump || true)"
   fi
+  MYSQL_BINLOG_BIN="$(command -v mysqlbinlog || true)"
+  if [[ -z "$MYSQL_BINLOG_BIN" ]]; then
+    MYSQL_BINLOG_BIN="$(command -v mariadb-binlog || true)"
+  fi
   [[ -n "$MYSQL_BIN" ]] || die "mysql client not found in image."
   [[ -n "$MYSQL_DUMP_BIN" ]] || die "mysqldump/mariadb-dump not found in image."
+  if [[ "$BACKUP_MODE" == "incremental" && -z "$MYSQL_BINLOG_BIN" ]]; then
+    die "mysqlbinlog/mariadb-binlog not found in image, cannot use BACKUP_MODE=incremental."
+  fi
 fi
 
 if [[ "$DB_TYPE" == "postgres" ]]; then
@@ -248,6 +432,170 @@ pg_query_scalar() {
   pg_exec -d "$database" -Atqc "$query"
 }
 
+get_mysql_master_status() {
+  local status_line
+  local file
+  local pos
+
+  status_line="$(mysql_exec -Nse "SHOW MASTER STATUS;" | head -n 1 || true)"
+  file="$(printf '%s' "$status_line" | awk '{print $1}')"
+  pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+
+  if [[ -z "$file" || -z "$pos" ]]; then
+    return 1
+  fi
+  if ! [[ "$pos" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  printf '%s\t%s\n' "$file" "$pos"
+}
+
+incremental_state_base_file=""
+incremental_state_base_pos=""
+incremental_state_last_file=""
+incremental_state_last_pos=""
+incremental_state_base_ts=""
+incremental_state_last_rebase_slot=""
+
+load_incremental_state() {
+  incremental_state_base_file=""
+  incremental_state_base_pos=""
+  incremental_state_last_file=""
+  incremental_state_last_pos=""
+  incremental_state_base_ts=""
+  incremental_state_last_rebase_slot=""
+
+  if [[ ! -f "$INCREMENTAL_STATE_PATH" ]]; then
+    return 0
+  fi
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      base_file)
+        incremental_state_base_file="$value"
+        ;;
+      base_pos)
+        incremental_state_base_pos="$value"
+        ;;
+      last_file)
+        incremental_state_last_file="$value"
+        ;;
+      last_pos)
+        incremental_state_last_pos="$value"
+        ;;
+      base_ts)
+        incremental_state_base_ts="$value"
+        ;;
+      last_rebase_slot)
+        incremental_state_last_rebase_slot="$value"
+        ;;
+    esac
+  done <"$INCREMENTAL_STATE_PATH"
+}
+
+save_incremental_state() {
+  local base_file="$1"
+  local base_pos="$2"
+  local last_file="$3"
+  local last_pos="$4"
+  local base_ts="$5"
+  local last_rebase_slot="${6:-$incremental_state_last_rebase_slot}"
+
+  atomic_write_content "$INCREMENTAL_STATE_PATH" "$(cat <<EOF
+base_file=${base_file}
+base_pos=${base_pos}
+last_file=${last_file}
+last_pos=${last_pos}
+base_ts=${base_ts}
+last_rebase_slot=${last_rebase_slot}
+EOF
+)"
+}
+
+incremental_rebase_required() {
+  local current_slot
+  current_slot="$(date +%Y%m%d%H%M)"
+
+  if ! cron_expression_matches_now "$INCREMENTAL_REBASE_CRON"; then
+    return 1
+  fi
+
+  [[ "$incremental_state_last_rebase_slot" != "$current_slot" ]]
+}
+
+mysql_log_exists_in_server() {
+  local target_file="$1"
+  local found
+  found="$(mysql_exec -Nse "SHOW BINARY LOGS;" | awk -v target="$target_file" '$1 == target { print "1"; exit }')"
+  [[ "$found" == "1" ]]
+}
+
+collect_mysql_binlog_delta() {
+  local start_file="$1"
+  local start_pos="$2"
+  local end_file="$3"
+  local end_pos="$4"
+  local output_path="$5"
+
+  local found_start=0
+  local found_end=0
+  local log_name
+  local -a logs=()
+  local -a cmd
+
+  mapfile -t logs < <(mysql_exec -Nse "SHOW BINARY LOGS;" | awk '{print $1}')
+  if [[ "${#logs[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  : >"$output_path"
+
+  for log_name in "${logs[@]}"; do
+    if [[ "$log_name" == "$start_file" ]]; then
+      found_start=1
+    fi
+    if [[ "$found_start" -ne 1 ]]; then
+      continue
+    fi
+
+    cmd=("$MYSQL_BINLOG_BIN" --read-from-remote-server --host="$DB_HOST" --port="$DB_PORT")
+    if [[ -n "$DB_USER" ]]; then
+      cmd+=(--user="$DB_USER")
+    fi
+
+    if [[ "$log_name" == "$start_file" ]]; then
+      cmd+=(--start-position="$start_pos")
+    fi
+    if [[ "$log_name" == "$end_file" ]]; then
+      cmd+=(--stop-position="$end_pos")
+      found_end=1
+    fi
+
+    cmd+=("$log_name")
+    MYSQL_PWD="$DB_PASSWORD" "${cmd[@]}" >>"$output_path"
+
+    if [[ "$log_name" == "$end_file" ]]; then
+      break
+    fi
+  done
+
+  [[ "$found_start" -eq 1 && "$found_end" -eq 1 ]]
+}
+
+append_incremental_delta_atomically() {
+  local delta_path="$1"
+  local tmp_path="${BACKUP_INCREMENTAL_SQL_PATH}.tmp"
+
+  if [[ -f "$BACKUP_INCREMENTAL_SQL_PATH" ]]; then
+    cat "$BACKUP_INCREMENTAL_SQL_PATH" >"$tmp_path"
+  else
+    : >"$tmp_path"
+  fi
+  cat "$delta_path" >>"$tmp_path"
+  mv "$tmp_path" "$BACKUP_INCREMENTAL_SQL_PATH"
+}
+
 db_ready() {
   case "$DB_TYPE" in
     mysql | mariadb)
@@ -334,7 +682,7 @@ latest_backup_exists() {
   esac
 }
 
-perform_backup() {
+perform_logical_backup() {
   ensure_backup_dir
   local tmp_path
   local rc
@@ -383,6 +731,136 @@ perform_backup() {
   esac
 }
 
+perform_incremental_backup_mysql() {
+  ensure_backup_dir
+
+  local status_line
+  local current_file
+  local current_pos
+  local now_ts
+  local current_slot
+  local delta_tmp_path
+
+  current_slot="$(date +%Y%m%d%H%M)"
+  status_line="$(get_mysql_master_status || true)"
+  current_file="$(printf '%s' "$status_line" | awk '{print $1}')"
+  current_pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+
+  if [[ -z "$current_file" || -z "$current_pos" ]]; then
+    die "BACKUP_MODE=incremental requires binary logs enabled on MySQL/MariaDB (SHOW MASTER STATUS is empty)."
+  fi
+
+  load_incremental_state
+
+  if [[ -z "$incremental_state_base_file" || -z "$incremental_state_last_file" || -z "$incremental_state_last_pos" ]]; then
+    log "INFO" "No incremental state found. Creating base logical backup first."
+    perform_logical_backup
+    status_line="$(get_mysql_master_status || true)"
+    current_file="$(printf '%s' "$status_line" | awk '{print $1}')"
+    current_pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+    [[ -n "$current_file" && -n "$current_pos" ]] || die "Unable to read MySQL master status after base backup."
+    now_ts="$(date +%s)"
+    save_incremental_state "$current_file" "$current_pos" "$current_file" "$current_pos" "$now_ts" "$current_slot"
+    atomic_write_content "$BACKUP_INCREMENTAL_SQL_PATH" ""
+    return 0
+  fi
+
+  if ! [[ "$incremental_state_last_pos" =~ ^[0-9]+$ ]]; then
+    log "WARN" "Incremental state position is invalid (${incremental_state_last_pos}), rebuilding base backup."
+    perform_logical_backup
+    status_line="$(get_mysql_master_status || true)"
+    current_file="$(printf '%s' "$status_line" | awk '{print $1}')"
+    current_pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+    [[ -n "$current_file" && -n "$current_pos" ]] || die "Unable to read MySQL master status after base backup."
+    now_ts="$(date +%s)"
+    save_incremental_state "$current_file" "$current_pos" "$current_file" "$current_pos" "$now_ts" "$current_slot"
+    atomic_write_content "$BACKUP_INCREMENTAL_SQL_PATH" ""
+    return 0
+  fi
+
+  if ! mysql_log_exists_in_server "$incremental_state_last_file"; then
+    log "WARN" "Last incremental log ${incremental_state_last_file} no longer exists on server. Rebuilding base backup."
+    perform_logical_backup
+    status_line="$(get_mysql_master_status || true)"
+    current_file="$(printf '%s' "$status_line" | awk '{print $1}')"
+    current_pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+    [[ -n "$current_file" && -n "$current_pos" ]] || die "Unable to read MySQL master status after base backup."
+    now_ts="$(date +%s)"
+    save_incremental_state "$current_file" "$current_pos" "$current_file" "$current_pos" "$now_ts" "$current_slot"
+    atomic_write_content "$BACKUP_INCREMENTAL_SQL_PATH" ""
+    return 0
+  fi
+
+  if incremental_rebase_required; then
+    log "INFO" "Incremental rebase cron matched (${INCREMENTAL_REBASE_CRON}), creating a new base logical backup."
+    perform_logical_backup
+    status_line="$(get_mysql_master_status || true)"
+    current_file="$(printf '%s' "$status_line" | awk '{print $1}')"
+    current_pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+    [[ -n "$current_file" && -n "$current_pos" ]] || die "Unable to read MySQL master status after base backup."
+    now_ts="$(date +%s)"
+    save_incremental_state "$current_file" "$current_pos" "$current_file" "$current_pos" "$now_ts" "$current_slot"
+    atomic_write_content "$BACKUP_INCREMENTAL_SQL_PATH" ""
+    return 0
+  fi
+
+  if [[ "$incremental_state_last_file" == "$current_file" ]] && (( current_pos <= incremental_state_last_pos )); then
+    log "INFO" "No new MySQL/MariaDB binlog events since last incremental checkpoint."
+    return 0
+  fi
+
+  delta_tmp_path="${BACKUP_INCREMENTAL_SQL_PATH}.delta.tmp"
+  if ! collect_mysql_binlog_delta "$incremental_state_last_file" "$incremental_state_last_pos" "$current_file" "$current_pos" "$delta_tmp_path"; then
+    rm -f "$delta_tmp_path"
+    log "WARN" "Unable to collect binlog delta cleanly; rebuilding base logical backup."
+    perform_logical_backup
+    status_line="$(get_mysql_master_status || true)"
+    current_file="$(printf '%s' "$status_line" | awk '{print $1}')"
+    current_pos="$(printf '%s' "$status_line" | awk '{print $2}')"
+    [[ -n "$current_file" && -n "$current_pos" ]] || die "Unable to read MySQL master status after base backup."
+    now_ts="$(date +%s)"
+    save_incremental_state "$current_file" "$current_pos" "$current_file" "$current_pos" "$now_ts" "$current_slot"
+    atomic_write_content "$BACKUP_INCREMENTAL_SQL_PATH" ""
+    return 0
+  fi
+
+  append_incremental_delta_atomically "$delta_tmp_path"
+  rm -f "$delta_tmp_path"
+
+  now_ts="${incremental_state_base_ts}"
+  if [[ -z "$now_ts" || ! "$now_ts" =~ ^[0-9]+$ ]]; then
+    now_ts="$(date +%s)"
+  fi
+  save_incremental_state \
+    "$incremental_state_base_file" \
+    "$incremental_state_base_pos" \
+    "$current_file" \
+    "$current_pos" \
+    "$now_ts"
+
+  log "INFO" "Incremental backup updated (${incremental_state_last_file}:${incremental_state_last_pos} -> ${current_file}:${current_pos})."
+}
+
+perform_incremental_backup() {
+  case "$DB_TYPE" in
+    mysql | mariadb)
+      perform_incremental_backup_mysql
+      ;;
+    postgres)
+      log "WARN" "BACKUP_MODE=incremental is not implemented for PostgreSQL yet; falling back to logical full backup."
+      perform_logical_backup
+      ;;
+  esac
+}
+
+perform_backup() {
+  if [[ "$BACKUP_MODE" == "incremental" ]]; then
+    perform_incremental_backup
+  else
+    perform_logical_backup
+  fi
+}
+
 ensure_postgres_database_exists() {
   if postgres_db_exists; then
     return 0
@@ -399,6 +877,10 @@ perform_restore() {
     mysql | mariadb)
       log "INFO" "Restoring ${BACKUP_SQL_PATH} into ${DB_NAME}."
       mysql_exec <"$BACKUP_SQL_PATH"
+      if [[ "$BACKUP_MODE" == "incremental" && -s "$BACKUP_INCREMENTAL_SQL_PATH" ]]; then
+        log "INFO" "Applying incremental SQL changes from ${BACKUP_INCREMENTAL_SQL_PATH}."
+        mysql_exec <"$BACKUP_INCREMENTAL_SQL_PATH"
+      fi
       ;;
     postgres)
       ensure_postgres_database_exists
@@ -532,7 +1014,7 @@ on_term() {
   shutdown_in_progress=1
 
   clear_startup_ready_state
-  log "INFO" "Signal received, attempting backup before exit."
+  log "INFO" "Signal received, attempting ${BACKUP_MODE} backup before exit."
   set +e
   if wait_for_db 10; then
     perform_backup
@@ -560,6 +1042,7 @@ case "$mode" in
       die "Database did not become ready within ${WAIT_TIMEOUT_SEC}s."
     fi
     log "INFO" "Database is reachable."
+    log "INFO" "Backup mode is ${BACKUP_MODE}."
 
     if [[ "$RESTORE_IF_EMPTY" == "1" ]]; then
       restore_if_empty_logic
@@ -587,7 +1070,7 @@ case "$mode" in
       die "Database did not become ready within ${WAIT_TIMEOUT_SEC}s."
     fi
     perform_backup
-    log "INFO" "Backup completed."
+    log "INFO" "Backup completed (mode=${BACKUP_MODE})."
     ;;
   restore-if-empty)
     log "INFO" "Mode=restore-if-empty, waiting for database at ${DB_HOST}:${DB_PORT}."
